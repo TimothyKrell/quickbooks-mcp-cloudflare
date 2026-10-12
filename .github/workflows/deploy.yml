@@ -1,0 +1,89 @@
+name: Deploy
+
+# Every push and PR is typechecked and tested. Pushes to main also deploy, in
+# repositories that set the repository variable DEPLOY to "true" and keep the
+# deployment's settings and secrets in a "production" environment. See the
+# README's "Deploy with GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: Only show what would change
+        type: boolean
+        default: false
+      adopt:
+        description: Take over existing Cloudflare resources this stack has no state for
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    name: Deploy
+    needs: check
+    if: vars.DEPLOY == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.QBO_DOMAIN && format('https://{0}', vars.QBO_DOMAIN) || '' }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      CI: "true"
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      INTUIT_CLIENT_ID: ${{ secrets.INTUIT_CLIENT_ID }}
+      INTUIT_CLIENT_SECRET: ${{ secrets.INTUIT_CLIENT_SECRET }}
+      QBO_ENVIRONMENT: ${{ vars.QBO_ENVIRONMENT }}
+      QBO_DOMAIN: ${{ vars.QBO_DOMAIN }}
+      WORKER_NAME: ${{ vars.WORKER_NAME }}
+      ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS }}
+      ALLOWED_REALM_IDS: ${{ vars.ALLOWED_REALM_IDS }}
+      ALLOW_CREATE: ${{ vars.ALLOW_CREATE }}
+      ALLOW_UPDATE: ${{ vars.ALLOW_UPDATE }}
+      ALLOW_DELETE: ${{ vars.ALLOW_DELETE }}
+      OPERATOR_NAME: ${{ vars.OPERATOR_NAME }}
+      OPERATOR_CONTACT: ${{ vars.OPERATOR_CONTACT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Drop unset settings
+        # GitHub passes unset variables as empty strings; alchemy should see them as absent.
+        run: |
+          for name in QBO_ENVIRONMENT QBO_DOMAIN WORKER_NAME ALLOWED_REALM_IDS ALLOW_CREATE ALLOW_UPDATE ALLOW_DELETE; do
+            if [ -z "${!name}" ]; then echo "$name" >> "$RUNNER_TEMP/unset"; fi
+          done
+          touch "$RUNNER_TEMP/unset"
+      - name: alchemy ${{ inputs.plan && 'plan' || 'deploy' }}
+        run: |
+          while read -r name; do unset "$name"; done < "$RUNNER_TEMP/unset"
+          npx alchemy ${{ inputs.plan && 'plan' || 'deploy --yes' }} --stage prod --no-input ${{ inputs.adopt && '--adopt' || '' }}
+      - name: Smoke test
+        if: ${{ !inputs.plan && vars.QBO_DOMAIN != '' }}
+        run: |
+          curl -fsS "https://$QBO_DOMAIN/.well-known/oauth-protected-resource/mcp" | grep -q "\"resource\":\"https://$QBO_DOMAIN/mcp\""
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "https://$QBO_DOMAIN/mcp")" = 401

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.alchemy/
+.env
+.env.*
+!.env.example
+# QuickBooks data exports; never commit
+backups/
